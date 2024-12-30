@@ -1,6 +1,43 @@
 ## History / Changelog
 
 
+### 1.3.2
+
+- `UrlStore.get_download_urls()`: `timelimit` removed, fix type hints (#119, 19c580e)
+- `extract_links()`: deprecate `base_url` parameter (#121)
+- setup: simplify workflow (#118)
+
+
+### 1.3.1
+
+- `UrlStore` compression: make bz2 and zlib optional, update pickle protocol (#113)
+- `extract_links()`: review and document, add deprecation warning for `base_url` argument (#115)
+- maintenance: add `__all__` to `init.py` and lint code (#116)
+
+
+### 1.3.0
+
+- parsing: validate netloc with port number by @naz-theori in #104
+- cleaning: fix handling of apostrophes (#107)
+- maintenance: deprecate Python 3.6 & 3.7, add `pyproject.toml` setup file (#59, #105)
+
+
+### 1.2.0
+
+- more compact UrlStore: use bytes instead of str for URL paths (#88)
+- UrlStore maintenance: deprecate `timelimit` argument (#101)
+- maintenance: simplify code (#103)
+- support for Python 3.13
+
+
+### 1.1.0
+
+- replace `langcodes` by `babel` and use its information on locales (#89, #92)
+- simplified and faster code: domain extraction, cleaning, filters and UrlStore (#90, #93, #94, #95)
+- UrlStore: better url batches, replace `timelimit` parameter by `time_limit` (#91)
+- maintenance: update readme and convert it to markdown (#97)
+
+
 ### 1.0.0
 
 - license change from GPLv3+ to Apache 2.0 (#81)

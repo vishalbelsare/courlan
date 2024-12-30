@@ -2,17 +2,31 @@
 Defines a URL store which holds URLs along with relevant information and entails crawling helpers.
 """
 
-import bz2
 import gc
 import logging
 import pickle
 import signal
 import sys
-import zlib
+
+try:
+    import bz2
+
+    HAS_BZ2 = True
+except ImportError:
+    HAS_BZ2 = False
+
+try:
+    import zlib
+
+    HAS_ZLIB = True
+except ImportError:
+    HAS_ZLIB = False
+
 
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from enum import Enum
+from operator import itemgetter
 from threading import Lock
 from typing import (
     Any,
@@ -37,6 +51,39 @@ from .urlutils import get_base_url, get_host_and_path, is_known_link
 LOGGER = logging.getLogger(__name__)
 
 
+class Compressor:
+    "Use system information on available compression modules and define corresponding methods."
+    __slots__ = ("compressor", "decompressor")
+
+    def __init__(self, compression: bool = True) -> None:
+        self.compressor: Any = (
+            bz2.compress
+            if compression and HAS_BZ2
+            else zlib.compress if compression and HAS_ZLIB else self._identical
+        )
+        self.decompressor: Any = (
+            bz2.decompress
+            if compression and HAS_BZ2
+            else zlib.decompress if compression and HAS_ZLIB else self._identical
+        )
+
+    @staticmethod
+    def _identical(data: Any) -> Any:
+        "Return unchanged data."
+        return data
+
+    def compress(self, data: Any) -> Any:
+        "Pickle the data and compress it if a method is available."
+        return self.compressor(pickle.dumps(data, protocol=5))
+
+    def decompress(self, data: bytes) -> Any:
+        "Decompress the data if a method is available and load the object."
+        return pickle.loads(self.decompressor(data))
+
+
+COMPRESSOR = Compressor()
+
+
 class State(Enum):
     "Record state information about a domain or host."
     OPEN = 1
@@ -48,10 +95,10 @@ class DomainEntry:
     "Class to record host-related information and URL paths."
     __slots__ = ("count", "rules", "state", "timestamp", "total", "tuples")
 
-    def __init__(self) -> None:
+    def __init__(self, state: State = State.OPEN) -> None:
         self.count: int = 0
         self.rules: Optional[RobotFileParser] = None
-        self.state: State = State.OPEN
+        self.state: State = state
         self.timestamp: Optional[Any] = None
         self.total: int = 0
         self.tuples: Deque[UrlPathTuple] = deque()
@@ -62,8 +109,12 @@ class UrlPathTuple:
     __slots__ = ("urlpath", "visited")
 
     def __init__(self, urlpath: str, visited: bool) -> None:
-        self.urlpath: str = urlpath
+        self.urlpath: bytes = urlpath.encode("utf-8")
         self.visited: bool = visited
+
+    def path(self) -> str:
+        "Get the URL path as string."
+        return self.urlpath.decode("utf-8")
 
 
 class UrlStore:
@@ -144,12 +195,12 @@ class UrlStore:
     def _load_urls(self, domain: str) -> Deque[UrlPathTuple]:
         if domain in self.urldict:
             if self.compressed:
-                return pickle.loads(bz2.decompress(self.urldict[domain].tuples))  # type: ignore
+                return COMPRESSOR.decompress(self.urldict[domain].tuples)  # type: ignore
             return self.urldict[domain].tuples
         return deque()
 
     def _set_done(self) -> None:
-        if not self.done and all(self.is_exhausted_domain(d) for d in self.urldict):
+        if not self.done and all(v.state != State.OPEN for v in self.urldict.values()):
             with self._lock:
                 self.done = True
 
@@ -179,22 +230,20 @@ class UrlStore:
             if self.urldict[domain].state is State.BUSTED:
                 return
             urls = self._load_urls(domain)
-            known = {u.urlpath for u in urls}
+            known = {u.path() for u in urls}
         else:
             urls = deque()
             known = set()
 
         # check if the link or its variants are known
         if to_right is not None:
-            urls.extend(t for t in to_right if not is_known_link(t.urlpath, known))
+            urls.extend(t for t in to_right if not is_known_link(t.path(), known))
         if to_left is not None:
-            urls.extendleft(t for t in to_left if not is_known_link(t.urlpath, known))
+            urls.extendleft(t for t in to_left if not is_known_link(t.path(), known))
 
         with self._lock:
             if self.compressed:
-                self.urldict[domain].tuples = bz2.compress(  # type: ignore[assignment]
-                    pickle.dumps(urls, protocol=4)
-                )
+                self.urldict[domain].tuples = COMPRESSOR.compress(urls)
             else:
                 self.urldict[domain].tuples = urls
             self.urldict[domain].total = len(urls)
@@ -215,14 +264,14 @@ class UrlStore:
         # init
         last_domain: Optional[str] = None
         known_paths: Dict[str, Optional[bool]] = {}
-        remaining_urls = {u: None for u in urls}
+        remaining_urls = dict.fromkeys(urls)
         # iterate
         for url in sorted(remaining_urls):
             hostinfo, urlpath = get_host_and_path(url)
             # examine domain
             if hostinfo != last_domain:
                 last_domain = hostinfo
-                known_paths = {u.urlpath: u.visited for u in self._load_urls(hostinfo)}
+                known_paths = {u.path(): u.visited for u in self._load_urls(hostinfo)}
             # run checks: case 1: the path matches, case 2: visited URL
             if urlpath in known_paths and (
                 switch == 1 or (switch == 2 and known_paths[urlpath])
@@ -230,9 +279,6 @@ class UrlStore:
                 del remaining_urls[url]
         # preserve input order
         return list(remaining_urls)
-
-    def _timestamp(self, domain: str) -> Optional[datetime]:
-        return self.urldict[domain].timestamp
 
     # ADDITIONS AND DELETIONS
 
@@ -279,8 +325,7 @@ class UrlStore:
         "Declare domains void and prune the store."
         with self._lock:
             for d in domains:
-                self.urldict[d] = DomainEntry()
-                self.urldict[d].state = State.BUSTED
+                self.urldict[d] = DomainEntry(state=State.BUSTED)
         self._set_done()
         num = gc.collect()
         LOGGER.debug("%s objects in GC after UrlStore.discard", num)
@@ -297,22 +342,17 @@ class UrlStore:
 
     def get_known_domains(self) -> List[str]:
         "Return all known domains as a list."
-        return list(self.urldict)
+        return list(self.urldict.keys())
 
     def get_unvisited_domains(self) -> List[str]:
         """Find all domains for which there are unvisited URLs
         and potentially adjust done meta-information."""
-        unvisited = []
-        if not self.done:
-            unvisited = [d for d in self.urldict if not self.is_exhausted_domain(d)]
-            if not unvisited:
-                self._set_done()
-        return unvisited
+        return [d for d, v in self.urldict.items() if v.state == State.OPEN]
 
     def is_exhausted_domain(self, domain: str) -> bool:
         "Tell if all known URLs for the website have been visited."
         if domain in self.urldict:
-            return self.urldict[domain].state in (State.ALL_VISITED, State.BUSTED)
+            return self.urldict[domain].state != State.OPEN
         return False
         # raise KeyError("website not in store")
 
@@ -324,14 +364,12 @@ class UrlStore:
 
     def find_known_urls(self, domain: str) -> List[str]:
         """Get all already known URLs for the given domain (ex. "https://example.org")."""
-        return [domain + u.urlpath for u in self._load_urls(domain)]
+        return [domain + u.path() for u in self._load_urls(domain)]
 
     def find_unvisited_urls(self, domain: str) -> List[str]:
         "Get all unvisited URLs for the given domain."
         if not self.is_exhausted_domain(domain):
-            return [
-                domain + u.urlpath for u in self._load_urls(domain) if not u.visited
-            ]
+            return [domain + u.path() for u in self._load_urls(domain) if not u.visited]
         return []
 
     def filter_unknown_urls(self, urls: List[str]) -> List[str]:
@@ -350,7 +388,7 @@ class UrlStore:
         "Check if the given URL has already been stored."
         hostinfo, urlpath = get_host_and_path(url)
         # returns False if domain or URL is new
-        return urlpath in {u.urlpath for u in self._load_urls(hostinfo)}
+        return urlpath in {u.path() for u in self._load_urls(hostinfo)}
 
     # DOWNLOADS
 
@@ -368,27 +406,35 @@ class UrlStore:
                         with self._lock:
                             self.urldict[domain].count += 1
                         self._store_urls(domain, url_tuples, timestamp=datetime.now())
-                    return domain + url.urlpath
+                    return domain + url.path()
         # nothing to draw from
         with self._lock:
             self.urldict[domain].state = State.ALL_VISITED
         self._set_done()
         return None
 
-    def get_download_urls(self, timelimit: int = 10) -> Optional[List[str]]:
+    def get_download_urls(
+        self,
+        time_limit: float = 10.0,
+        max_urls: int = 10000,
+    ) -> List[str]:
         """Get a list of immediately downloadable URLs according to the given
         time limit per domain."""
-        potential = self.get_unvisited_domains()
-        targets = []
-        for domain in potential:
-            timestamp = self._timestamp(domain)
+        urls = []
+        for website, entry in self.urldict.items():
+            if entry.state != State.OPEN:
+                continue
             if (
-                timestamp is None
-                or (datetime.now() - timestamp).total_seconds() > timelimit
+                not entry.timestamp
+                or (datetime.now() - entry.timestamp).total_seconds() > time_limit
             ):
-                targets.append(domain)
-        # get corresponding URLs and filter out None values
-        return list(filter(None, [self.get_url(domain) for domain in targets]))
+                url = self.get_url(website)
+                if url is not None:
+                    urls.append(url)
+                    if len(urls) >= max_urls:
+                        break
+        self._set_done()
+        return urls
 
     def establish_download_schedule(
         self, max_urls: int = 100, time_limit: int = 10
@@ -415,15 +461,15 @@ class UrlStore:
                 ):
                     break
                 if not url.visited:
-                    urlpaths.append(url.urlpath)
+                    urlpaths.append(url.path())
                     url.visited = True
                     with self._lock:
                         self.urldict[domain].count += 1
             # determine timestamps
             now = datetime.now()
-            original_timestamp = self._timestamp(domain)
+            original_timestamp = self.urldict[domain].timestamp
             if (
-                original_timestamp is None
+                not original_timestamp
                 or (now - original_timestamp).total_seconds() > time_limit
             ):
                 schedule_secs = 0.0
@@ -440,23 +486,21 @@ class UrlStore:
             self._store_urls(domain, url_tuples, timestamp=total_diff)
         # sort by first tuple element (time in secs)
         self._set_done()
-        return sorted(targets, key=lambda x: x[0])  # type: ignore[arg-type]
+        return sorted(targets, key=itemgetter(1))  # type: ignore[arg-type]
 
     # CRAWLING
 
     def store_rules(self, website: str, rules: Optional[RobotFileParser]) -> None:
         "Store crawling rules for a given website."
         if self.compressed:
-            rules = zlib.compress(  # type: ignore[assignment]
-                pickle.dumps(rules, protocol=4)
-            )
+            rules = COMPRESSOR.compress(rules)
         self.urldict[website].rules = rules
 
     def get_rules(self, website: str) -> Optional[RobotFileParser]:
         "Return the stored crawling rules for the given website."
         if website in self.urldict:
             if self.compressed:
-                return pickle.loads(zlib.decompress(self.urldict[website].rules))  # type: ignore
+                return COMPRESSOR.decompress(self.urldict[website].rules)  # type: ignore
             return self.urldict[website].rules
         return None
 
@@ -475,15 +519,15 @@ class UrlStore:
 
     def get_all_counts(self) -> List[int]:
         "Return all download counts for the hosts in store."
-        return [self.urldict[d].count for d in self.urldict]
+        return [v.count for v in self.urldict.values()]
 
     def total_url_number(self) -> int:
         "Find number of all URLs in store."
-        return sum(self.urldict[d].total for d in self.urldict)
+        return sum(v.total for v in self.urldict.values())
 
     def download_threshold_reached(self, threshold: float) -> bool:
         "Find out if the download limit (in seconds) has been reached for one of the websites in store."
-        return any(self.urldict[d].count >= threshold for d in self.urldict)
+        return any(v.count >= threshold for v in self.urldict.values())
 
     def dump_urls(self) -> List[str]:
         "Return a list of all known URLs."
@@ -503,7 +547,7 @@ class UrlStore:
             print(
                 "\n".join(
                     [
-                        domain + u.urlpath + "\t" + str(u.visited)
+                        f"{domain}{u.path()}\t{str(u.visited)}"
                         for u in self._load_urls(domain)
                     ]
                 ),

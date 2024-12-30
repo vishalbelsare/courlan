@@ -16,8 +16,17 @@ from time import sleep
 import pytest
 
 from courlan import UrlStore
-from courlan.core import filter_links
-from courlan.urlstore import State, load_store
+from courlan.urlstore import Compressor, State, load_store, HAS_BZ2, HAS_ZLIB
+
+
+def test_compressor():
+    "Test compression class."
+    assert HAS_BZ2 or HAS_ZLIB
+    data = 1234
+
+    for setting in (True, False):
+        comp = Compressor(compression=setting)
+        assert comp.decompress(comp.compress(data)) == data
 
 
 def test_urlstore():
@@ -38,7 +47,7 @@ def test_urlstore():
     assert len(my_urls.urldict) == 1 and "http://example.org" not in my_urls.urldict
     assert len(my_urls.urldict["https://example.org"].tuples) == 2
     firstelem = my_urls.urldict["https://example.org"].tuples[0]
-    assert firstelem.urlpath == "/" and firstelem.visited is False
+    assert firstelem.urlpath == b"/" and firstelem.visited is False
     # reset
     num, _, _ = gc.get_count()
     my_urls.reset()
@@ -188,7 +197,7 @@ def test_urlstore():
     my_urls.add_urls(appendleft=extension_urls)
     url_tuples = my_urls._load_urls(example_domain)
     assert len(url_tuples) == len(example_urls) + 11
-    assert url_tuples[-1].urlpath == "/1/9" and url_tuples[0].urlpath == "/1/10"
+    assert url_tuples[-1].urlpath == b"/1/9" and url_tuples[0].urlpath == b"/1/10"
 
     # duplicates
     my_urls.add_urls(extension_urls)
@@ -196,7 +205,7 @@ def test_urlstore():
     assert len(my_urls._load_urls(example_domain)) == len(example_urls) + len(
         extension_urls
     )
-    assert url_tuples[-1].urlpath == "/1/9" and url_tuples[0].urlpath == "/1/10"
+    assert url_tuples[-1].urlpath == b"/1/9" and url_tuples[0].urlpath == b"/1/10"
 
     # get_url
     assert my_urls.urldict[example_domain].timestamp is None
@@ -222,7 +231,9 @@ def test_urlstore():
 
     url_tuples = my_urls._load_urls(example_domain)
     # positions
-    assert url1.endswith(url_tuples[0].urlpath) and url2.endswith(url_tuples[1].urlpath)
+    assert url1.endswith(url_tuples[0].urlpath.decode("utf-8")) and url2.endswith(
+        url_tuples[1].urlpath.decode("utf-8")
+    )
     # timestamp
     assert my_urls.urldict[example_domain].timestamp is not None
     # nothing left
@@ -287,18 +298,33 @@ def test_urlstore():
     assert my_urls.total_url_number() == 20014
 
     # get download URLs
-    downloadable_urls = my_urls.get_download_urls(timelimit=0)
+    downloadable_urls = my_urls.get_download_urls(time_limit=0, max_urls=1)
     assert (
-        len(downloadable_urls) == 2
+        len(downloadable_urls) == 1
         and downloadable_urls[0] == "https://www.example.org/1"
     )
     assert (
         datetime.now() - my_urls.urldict["https://www.example.org"].timestamp
     ).total_seconds() < 0.25
     assert my_urls.urldict["https://www.example.org"].count == 3
-    assert my_urls.urldict["https://test.org"].count == 1
-    downloadable_urls = my_urls.get_download_urls()  # limit=10
+
+    # does not work on Windows?
+    # if os.name != "nt":
+    test_urls = UrlStore()
+    test_urls.add_urls(
+        ["https://www.example.org/1", "https://test.org/1", "https://test.org/2"]
+    )
+
+    downloadable_urls = test_urls.get_download_urls(time_limit=0)
+    assert (
+        len(downloadable_urls) == 2
+        and downloadable_urls[0].startswith("https://www.example.org")
+        and downloadable_urls[1].startswith("https://test.org")
+        and test_urls.urldict["https://test.org"].count == 1
+    )
+    downloadable_urls = test_urls.get_download_urls()
     assert len(downloadable_urls) == 0
+
     other_store = UrlStore()
     downloadable_urls = other_store.get_download_urls()
     assert not downloadable_urls and other_store.done is True
@@ -320,14 +346,14 @@ def test_urlstore():
     assert (
         len(schedule) == 1
         and round(schedule[0][0]) == 1
-        and schedule[0][1] == "https://www.example.org/2"
+        and schedule[0][1].startswith("https://www.example.org")
     )
     schedule = my_urls.establish_download_schedule(max_urls=6, time_limit=1)
     assert len(schedule) == 6 and round(max(s[0] for s in schedule)) == 4
     assert my_urls.urldict["https://www.example.org"].count == 7
     assert (
         my_urls.urldict["https://test.org"].count
-        == 4
+        == 3
         == sum(u.visited is True for u in my_urls.urldict["https://test.org"].tuples)
     )
     assert my_urls.download_threshold_reached(8) is False

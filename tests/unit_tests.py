@@ -37,9 +37,15 @@ from courlan import (
     lang_filter,
 )
 from courlan.core import filter_links
-from courlan.filters import domain_filter, extension_filter, path_filter, type_filter
+from courlan.filters import (
+    domain_filter,
+    extension_filter,
+    langcodes_score,
+    path_filter,
+    type_filter,
+)
 from courlan.meta import clear_caches
-from courlan.urlutils import _parse, get_tldinfo, is_known_link
+from courlan.urlutils import _parse, is_known_link
 
 
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
@@ -147,6 +153,9 @@ def test_scrub():
     assert clean_url(5) is None
     assert clean_url("ø\xaa") == "%C3%B8%C2%AA"
     assert clean_url("https://example.org/?p=100") == "https://example.org/?p=100"
+    assert clean_url("https://example.org/ab'c") == "https://example.org/ab%27c"
+    assert clean_url('https://example.org/abc"') == "https://example.org/abc"
+    assert clean_url("https://example.org/abc<") == "https://example.org/abc"
     assert clean_url("https://example.org/\t?p=100") == "https://example.org/?p=100"
     assert (
         clean_url("https://example.org:443/file.html?p=100&abc=1#frag")
@@ -243,6 +252,9 @@ def test_spam_filter():
 
 def test_type_filter():
     assert type_filter("http://www.example.org/feed") is False
+    # wp
+    assert type_filter("http://www.example.org/wp-admin/") is False
+    assert type_filter("http://www.example.org/wp-includes/this") is False
     # straight category
     assert type_filter("http://www.example.org/category/123") is False
     assert type_filter("http://www.example.org/product-category/123") is False
@@ -440,6 +452,13 @@ def test_lang_filter():
         lang_filter("http://bz.berlin1.de/kino/050513/fans.html", "de", strict=True)
         is False
     )
+    assert langcodes_score("en", "en_HK", 0) == 1
+    assert langcodes_score("en", "en-HK", 0) == 1
+    assert langcodes_score("en", "en_XY", 0) == 0
+    assert langcodes_score("en", "en-XY", 0) == 0
+    assert langcodes_score("en", "de_DE", 0) == -1
+    assert langcodes_score("en", "de-DE", 0) == -1
+
     # assert lang_filter('http://www.verfassungen.de/ch/basel/verf03.htm'. 'de') is True
     # assert lang_filter('http://www.uni-stuttgart.de/hi/fnz/lehrveranst.html', 'de') is True
     # http://www.wildwechsel.de/ww/front_content.php?idcatart=177&lang=4&client=6&a=view&eintrag=100&a=view&eintrag=0&a=view&eintrag=20&a=view&eintrag=80&a=view&eintrag=20
@@ -690,6 +709,10 @@ def test_urlcheck():
     assert check_url("http://[2001:0db8:85a3:0000:0000:8a2e:0370:7334]") is None
     assert check_url("http://1:2:3:4:5:6:7:8:9") is None
 
+    # port
+    assert check_url("http://example.com:80") is not None
+    assert check_url("http://example.com:80:80") is None
+
 
 def test_domain_filter():
     "Test filters related to domain and hostnames."
@@ -839,7 +862,9 @@ def test_external():
 
 def test_extraction():
     """test link comparison in HTML"""
-    assert len(extract_links(None, "https://test.com/", False)) == 0
+    with pytest.raises(ValueError):
+        extract_links(None, base_url="https://test.com/", external_bool=False)
+    assert len(extract_links(None, url="https://test.com/", external_bool=False)) == 0
     assert len(extract_links("", "https://test.com/", False)) == 0
     # link known under another form
     pagecontent = '<html><a href="https://test.org/example"/><a href="https://test.org/example/&"/></html>'
@@ -910,7 +935,7 @@ def test_extraction():
         "https://httpbin.org/links/2/1",
     ]
     links = extract_links(
-        pagecontent, base_url="https://httpbin.org", external_bool=False, with_nav=True
+        pagecontent, url="https://httpbin.org", external_bool=False, with_nav=True
     )
     assert sorted(links) == [
         "https://httpbin.org/links/2/0",
@@ -1010,11 +1035,17 @@ def test_extraction():
         "https://test.com/example",
         "https://test.com/page/2",
     ]
+
     # link filtering
     base_url = "https://example.org"
     htmlstring = '<html><body><a href="https://example.org/page1"/><a href="https://example.org/page1/"/><a href="https://test.org/page1"/></body></html>'
-    links, links_priority = filter_links(htmlstring, base_url)
+
+    with pytest.raises(ValueError):
+        filter_links(htmlstring, url=None, base_url=base_url)
+
+    links, links_priority = filter_links(htmlstring, url=base_url)
     assert len(links) == 1 and not links_priority
+
     # link filtering with relative URLs
     url = "https://example.org/page1.html"
     htmlstring = '<html><body><a href="/subpage1"/><a href="/subpage1/"/><a href="https://test.org/page1"/></body></html>'
@@ -1171,16 +1202,18 @@ def test_examples():
 
 def test_meta():
     "Test package meta functions."
-    url = "https://example.net/123/abc"
-    _ = get_tldinfo(url)
-    _ = _parse(url)
-    assert get_tldinfo.cache_info().currsize > 0
+    _ = langcodes_score("en", "en_HK", 0)
+    _ = _parse("https://example.net/123/abc")
+
+    assert langcodes_score.cache_info().currsize > 0
     try:
         urlsplit_lrucache = True
         assert urlsplit.cache_info().currsize > 0
     except AttributeError:  # newer Python versions only
         urlsplit_lrucache = False
+
     clear_caches()
-    assert get_tldinfo.cache_info().currsize == 0
+
+    assert langcodes_score.cache_info().currsize == 0
     if urlsplit_lrucache:
         assert urlsplit.cache_info().currsize == 0
